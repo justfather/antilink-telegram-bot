@@ -13,6 +13,10 @@ LINK_PATTERN = re.compile(
     r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
     r'|www\.[a-zA-Z0-9.-]+'
     r'|t\.me/[a-zA-Z0-9_]+'
+    r'|tg://[^\s]+'
+    r'|@[a-zA-Z0-9_]{5,}'
+    r'|[a-zA-Z0-9-]+\.(com|net|org|io|me|co|xyz|info|biz|link|click|site|online|top|pro|vip)'
+    r'|[a-zA-Z0-9]+\s*\.\s*[a-zA-Z]{2,}'
 )
 
 # เก็บข้อมูลการเตือนของผู้ใช้ {chat_id: {user_id: warning_count}}
@@ -46,18 +50,55 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ตรวจสอบข้อความว่ามีลิงก์หรือไม่"""
-    if update.message and update.message.text:
+    if update.message:
         message = update.message
-        text = message.text
         user = message.from_user
         chat_id = message.chat_id
         user_id = user.id
 
-        # ตรวจสอบว่าข้อความมีลิงก์หรือไม่
-        if LINK_PATTERN.search(text):
+        # รวบรวมข้อความที่ต้องตรวจสอบ
+        text_to_check = []
+
+        # ตรวจสอบข้อความธรรมดา
+        if message.text:
+            text_to_check.append(message.text)
+
+        # ตรวจสอบ caption ของรูปภาพ/วิดีโอ/เอกสาร
+        if message.caption:
+            text_to_check.append(message.caption)
+
+        # ตรวจสอบ inline buttons
+        if message.reply_markup and message.reply_markup.inline_keyboard:
+            for row in message.reply_markup.inline_keyboard:
+                for button in row:
+                    if button.url:
+                        text_to_check.append(button.url)
+
+        # ตรวจสอบ URL entities (ลิงก์ที่ซ่อนอยู่ใน text)
+        if message.entities:
+            for entity in message.entities:
+                if entity.type in ['url', 'text_link']:
+                    if entity.type == 'text_link' and entity.url:
+                        text_to_check.append(entity.url)
+
+        # ตรวจสอบ caption entities
+        if message.caption_entities:
+            for entity in message.caption_entities:
+                if entity.type in ['url', 'text_link']:
+                    if entity.type == 'text_link' and entity.url:
+                        text_to_check.append(entity.url)
+
+        # ตรวจสอบว่ามีลิงก์หรือไม่
+        has_link = any(LINK_PATTERN.search(text) for text in text_to_check if text)
+
+        # ตรวจสอบ forward message ที่มีลิงก์เท่านั้น
+        is_forwarded = message.forward_date is not None or message.forward_from is not None or message.forward_from_chat is not None
+        is_forwarded_with_link = is_forwarded and has_link
+
+        if has_link:
             # ตรวจสอบว่าผู้ใช้เป็น Admin หรือไม่
             if await is_user_admin(update, context, user_id):
-                print(f"Admin {user.first_name} ส่งลิงก์ - ไม่ดำเนินการ")
+                print(f"Admin {user.first_name} ส่งลิงก์/forward - ไม่ดำเนินการ")
                 return
 
             try:
@@ -81,12 +122,13 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # ตรวจสอบจำนวนการเตือน
                 if warning_count == 1:
                     # ครั้งแรก: เตือน
+                    warning_reason = "ส่งลิงก์/forward message" if is_forwarded_with_link else "ส่งลิงก์"
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text=f"⚠️ {username} ห้ามส่งลิงก์ในกลุ่มนี้!\n\n"
-                             f"🔴 นี่คือการเตือนครั้งแรก หากส่งลิงก์อีกครั้งจะถูกแบนทันที!"
+                        text=f"⚠️ {username} ห้าม{warning_reason}ในกลุ่มนี้!\n\n"
+                             f"🔴 นี่คือการเตือนครั้งแรก หากฝ่าฝืนอีกครั้งจะถูกแบนทันที!"
                     )
-                    print(f"เตือนผู้ใช้ {username} ครั้งที่ 1")
+                    print(f"เตือนผู้ใช้ {username} ครั้งที่ 1 ({warning_reason})")
 
                 elif warning_count >= 2:
                     # ครั้งที่สอง: แบน
@@ -121,8 +163,11 @@ def main():
     # เพิ่ม Command Handlers
     application.add_handler(CommandHandler("start", start_command))
 
-    # เพิ่ม Message Handler สำหรับตรวจสอบข้อความทั้งหมด
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_message))
+    # เพิ่ม Message Handler สำหรับตรวจสอบข้อความทั้งหมด (รวมรูปภาพ/วิดีโอ/เอกสาร)
+    application.add_handler(MessageHandler(
+        (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.ANIMATION) & ~filters.COMMAND,
+        check_message
+    ))
 
     # เริ่มรันบอท
     print("✅ บอทเริ่มทำงานแล้ว!")
