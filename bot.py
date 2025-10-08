@@ -22,6 +22,9 @@ LINK_PATTERN = re.compile(
 # เก็บข้อมูลการเตือนของผู้ใช้ {chat_id: {user_id: warning_count}}
 user_warnings = {}
 
+# เก็บข้อมูล forward spam {chat_id: {user_id: [timestamps]}}
+forward_tracker = {}
+
 async def is_user_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
     """ตรวจสอบว่าผู้ใช้เป็น Admin หรือไม่"""
     try:
@@ -55,6 +58,10 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = message.from_user
         chat_id = message.chat_id
         user_id = user.id
+
+        # ตรวจสอบว่าเป็น Admin หรือไม่ (ยกเว้น admin ทันที)
+        if await is_user_admin(update, context, user_id):
+            return
 
         # รวบรวมข้อความที่ต้องตรวจสอบ
         text_to_check = []
@@ -91,15 +98,58 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ตรวจสอบว่ามีลิงก์หรือไม่
         has_link = any(LINK_PATTERN.search(text) for text in text_to_check if text)
 
-        # ตรวจสอบ forward message ที่มีลิงก์เท่านั้น
-        is_forwarded = message.forward_date is not None or message.forward_from is not None or message.forward_from_chat is not None
+        # ตรวจสอบ forward message (รองรับทั้ง v20 และ v21+)
+        is_forwarded = (
+            hasattr(message, 'forward_origin') and message.forward_origin is not None  # v21+
+        ) or (
+            hasattr(message, 'forward_date') and message.forward_date is not None  # v20
+        )
         is_forwarded_with_link = is_forwarded and has_link
 
+        # ตรวจสอบ Forward Spam Flooding
+        if is_forwarded:
+            import time
+            current_time = time.time()
+
+            # สร้าง dictionary สำหรับกลุ่มนี้ถ้ายังไม่มี
+            if chat_id not in forward_tracker:
+                forward_tracker[chat_id] = {}
+            if user_id not in forward_tracker[chat_id]:
+                forward_tracker[chat_id][user_id] = []
+
+            # เพิ่ม timestamp
+            forward_tracker[chat_id][user_id].append(current_time)
+
+            # ลบ timestamp เก่าที่เกิน 30 วินาที
+            forward_tracker[chat_id][user_id] = [
+                t for t in forward_tracker[chat_id][user_id]
+                if current_time - t <= 30
+            ]
+
+            # นับจำนวน forward ใน 30 วินาที
+            forward_count = len(forward_tracker[chat_id][user_id])
+
+            # ถ้า forward มากกว่า 3 ครั้งใน 30 วินาที = spam flooding
+            if forward_count >= 3:
+                try:
+                    await message.delete()
+                    await context.bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
+
+                    username = f"@{user.username}" if user.username else user.first_name
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"🔨 {username} ถูกแบนอัตโนมัติเนื่องจาก Forward Spam Flooding!\n\n"
+                             f"⚠️ ตรวจพบการ forward ข้อความ {forward_count} ครั้งภายใน 30 วินาที"
+                    )
+                    print(f"แบน {username} เนื่องจาก forward spam ({forward_count} ครั้ง)")
+
+                    # ลบข้อมูล tracker
+                    del forward_tracker[chat_id][user_id]
+                    return
+                except Exception as e:
+                    print(f"ข้อผิดพลาดในการแบน forward spammer: {e}")
+
         if has_link:
-            # ตรวจสอบว่าผู้ใช้เป็น Admin หรือไม่
-            if await is_user_admin(update, context, user_id):
-                print(f"Admin {user.first_name} ส่งลิงก์/forward - ไม่ดำเนินการ")
-                return
 
             try:
                 # ลบข้อความที่มีลิงก์
